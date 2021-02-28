@@ -1,0 +1,493 @@
+package com.hp.ci.mgmt.executors;
+
+import com.google.common.base.Strings;
+import com.hp.ci.mgmt.fusion.messages.CommonMessage;
+import com.hp.ci.mgmt.fusion.util.L10nCatalog;
+import com.hp.ci.mgmt.logs.debug.DebugLog;
+import com.hp.ci.mgmt.request.HttpRequestSettable;
+import com.hp.ci.mgmt.request.HttpServletRequestCopy;
+import com.hp.ci.mgmt.tasks.CiScheduledExecutor;
+import java.io.Serializable;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
+import org.springframework.context.annotation.DependsOn;
+import org.springframework.context.annotation.Scope;
+import org.springframework.context.i18n.LocaleContextHolder;
+import org.springframework.core.task.TaskRejectedException;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+
+@Component
+@DependsOn({"ciTaskScheduler"})
+@Scope("prototype")
+public class FusionAsyncExecutor
+  implements AsyncExecutorInterface
+{
+  private static final DebugLog LOG = new DebugLog("common", FusionAsyncExecutor.class);
+  private static final int DEFAULT_CONCURRENT_TASKS = 10;
+  private static final int DEFAULT_QUEUE_SIZE = 2147483647;
+  private static final L10nCatalog<CommonMessage> CATALOG = CommonMessage.getL10nCatalog();
+
+  private ExecutorState executorState = ExecutorState.INIT;
+  private int concurrentTaskLimit = 10;
+  private int poolSize;
+  private ScheduledThreadPoolExecutor customExecutor;
+  private final LinkedList<ExecRequestContext> taskQueue = new LinkedList();
+  private String tagName = "";
+  private int maxQueueSize = 2147483647;
+
+  @Resource(name="ciScheduledExecutor")
+  private CiScheduledExecutor exec;
+
+  @Resource
+  private HttpRequestSettable httpRequestService;
+
+  public FusionAsyncExecutor()
+  {
+  }
+
+  public FusionAsyncExecutor(HttpRequestSettable httpRequestService)
+  {
+    this.httpRequestService = httpRequestService;
+  }
+
+  void oneMorePoolItem()
+  {
+    this.poolSize += 1;
+  }
+
+  void oneLessPoolItem()
+  {
+    this.poolSize -= 1;
+  }
+
+  String getErrMsg()
+  {
+    String msg = null;
+    ScheduledThreadPoolExecutor executor = this.customExecutor;
+    if ((this.executorState != ExecutorState.RUNNING) || (executor == null) || (executor.isShutdown()))
+    {
+      msg = CATALOG.getMessage(CommonMessage.TASK_REJECTED_EXECUTOR_STOPPED);
+    }
+    else
+    {
+      msg = CATALOG.getMessage(CommonMessage.TASK_REJECTED_QUEUE_FULL);
+    }
+    if (msg != null)
+    {
+      LOG.error("submitTask(): {}", new Object[] { msg });
+    }
+    return msg;
+  }
+
+  private void addToQueue(ExecRequestContext erc)
+  {
+    this.taskQueue.add(erc);
+  }
+
+  protected ExecRequestContext pollFromQueue()
+  {
+    return (ExecRequestContext)this.taskQueue.poll();
+  }
+
+  public FusionRunnable[] getTaskQueue()
+  {
+    Object[] objects = this.taskQueue.toArray();
+
+    FusionRunnable[] runnables = new FusionRunnable[objects.length];
+
+    for (int i = 0; i < objects.length; i++)
+    {
+      runnables[i] = ((ExecRequestContext)objects[i]).getRunnable();
+    }
+
+    return runnables;
+  }
+
+  protected final void dispatchOneFromQueue()
+  {
+    if (remainingPoolCapacity() > 0)
+    {
+      ExecRequestContext erc = pollFromQueue();
+      if (erc != null)
+      {
+        erc.dispatch();
+      }
+    }
+  }
+
+  protected final int remainingPoolCapacity()
+  {
+    return this.concurrentTaskLimit - this.poolSize;
+  }
+
+  protected final int remainingCapacity()
+  {
+    return this.maxQueueSize - this.taskQueue.size();
+  }
+
+  public void startExecutor(int concurrentTaskLimit)
+  {
+    startExecutor(concurrentTaskLimit, 2147483647, null, null);
+  }
+
+  public void startExecutor(int concurrentTaskLimit, int maxQueueSize)
+  {
+    startExecutor(concurrentTaskLimit, maxQueueSize, null, null);
+  }
+
+  public void startExecutor(int concurrentTaskLimit, int maxQueueSize, String backgroundThreadName)
+  {
+    startExecutor(concurrentTaskLimit, maxQueueSize, backgroundThreadName, null);
+  }
+
+  public synchronized void startExecutor(int concurrentTaskLimit, int maxQueueSize, String backgroundThreadName, ScheduledThreadPoolExecutor backendExecutor)
+  {
+    if (this.executorState == ExecutorState.INIT)
+    {
+      this.concurrentTaskLimit = (concurrentTaskLimit > 0 ? concurrentTaskLimit : 10);
+
+      this.maxQueueSize = (maxQueueSize > 0 ? maxQueueSize : 2147483647);
+      this.tagName = Strings.nullToEmpty(backgroundThreadName);
+      this.customExecutor = (backendExecutor != null ? backendExecutor : this.exec);
+      this.executorState = ExecutorState.RUNNING;
+    }
+  }
+
+  public void startExecutorWithTemplate(AsyncExecutorInterface templateExecutor)
+  {
+    if (templateExecutor != null)
+    {
+      if ((templateExecutor.isExecutorRunning()) || (templateExecutor.isExecutorShutdown()))
+      {
+        startExecutor(templateExecutor.getConcurrentTaskLimit(), templateExecutor.getMaxQueueSize(), templateExecutor.getTagName(), templateExecutor.getScheduledExecutor());
+      }
+    }
+  }
+
+  public synchronized ScheduledThreadPoolExecutor getScheduledExecutor()
+  {
+    return this.customExecutor;
+  }
+
+  public void stopExecutor()
+  {
+    synchronized (this)
+    {
+      if (this.executorState == ExecutorState.RUNNING)
+      {
+        this.executorState = ExecutorState.SHUTDOWN;
+
+        this.taskQueue.clear();
+        LOG.debug("stopExecutor()");
+      }
+    }
+  }
+
+  public synchronized void submitTask(FusionRunnable task)
+  {
+    if (this.executorState != ExecutorState.RUNNING)
+    {
+      String msg = getErrMsg();
+      throw new TaskRejectedException(msg);
+    }
+    if (remainingPoolCapacity() > 0)
+    {
+      ExecRequestContext erc = pollFromQueue();
+      boolean hasQueueEntry = erc != null;
+      if (!hasQueueEntry)
+      {
+        erc = new ExecRequestContext(task);
+      }
+      else
+      {
+        addToQueue(new ExecRequestContext(task));
+      }
+      if (LOG.isDebugEnabled())
+      {
+        ScheduledThreadPoolExecutor backEndPool = this.customExecutor;
+        int activeCount = backEndPool.getActiveCount();
+        int corePoolSize = backEndPool.getCorePoolSize();
+        LOG.debug("direct dispatch deferred={}, {} out of {}", new Object[] { Boolean.valueOf(hasQueueEntry), Integer.valueOf(activeCount), Integer.valueOf(corePoolSize) });
+      }
+      RuntimeException ex = erc.dispatch();
+      if (ex != null)
+      {
+        throw ex;
+      }
+    }
+    else if (remainingCapacity() > 0)
+    {
+      addToQueue(new ExecRequestContext(task));
+      LOG.debug("Adding task to queue since throttling limit is reached.");
+    }
+    else
+    {
+      LOG.warn("Cannot run task because the task queue is full (size = {})", new Object[] { Integer.valueOf(this.taskQueue.size()) });
+      String msg = getErrMsg();
+      throw new TaskRejectedException(msg);
+    }
+  }
+
+  public synchronized boolean isExecutorRunning()
+  {
+    return this.executorState == ExecutorState.RUNNING;
+  }
+
+  public synchronized boolean isExecutorShutdown()
+  {
+    return this.executorState == ExecutorState.SHUTDOWN;
+  }
+
+  public int getMaxQueueSize()
+  {
+    synchronized (this)
+    {
+      return this.maxQueueSize;
+    }
+  }
+
+  public int getConcurrentTaskLimit()
+  {
+    synchronized (this)
+    {
+      return this.concurrentTaskLimit;
+    }
+  }
+
+  public String getTagName()
+  {
+    synchronized (this)
+    {
+      return this.tagName;
+    }
+  }
+
+  public int getRemainingCapacity()
+  {
+    synchronized (this)
+    {
+      if (this.executorState != ExecutorState.RUNNING)
+      {
+        return 0;
+      }
+      return remainingCapacity();
+    }
+  }
+
+  public int getRemainingPoolCapacity()
+  {
+    synchronized (this)
+    {
+      if (this.executorState != ExecutorState.RUNNING)
+      {
+        return 0;
+      }
+      return remainingPoolCapacity();
+    }
+  }
+
+  public boolean isPoolBusy()
+  {
+    synchronized (this)
+    {
+      if (this.executorState != ExecutorState.RUNNING)
+      {
+        return true;
+      }
+      ScheduledThreadPoolExecutor backEndPool = this.customExecutor;
+      return (remainingPoolCapacity() == 0) || ((backEndPool != null) && (backEndPool.getActiveCount() >= backEndPool.getCorePoolSize()));
+    }
+  }
+
+  public String toString()
+  {
+    synchronized (this)
+    {
+      StringBuilder buf = new StringBuilder();
+      buf.append("FusionAsyncExecutor: ");
+      buf.append(this.tagName);
+      buf.append('\n');
+      buf.append(new StringBuilder().append("max pool size: ").append(this.concurrentTaskLimit).toString());
+      buf.append('\n');
+      buf.append(new StringBuilder().append("remaining pool capacity: ").append(remainingPoolCapacity()).toString());
+      buf.append('\n');
+      buf.append(new StringBuilder().append("max queue size: ").append(this.maxQueueSize).toString());
+      buf.append('\n');
+      buf.append("queue:\n");
+      Iterator it = this.taskQueue.iterator();
+      while (it.hasNext())
+      {
+        ExecRequestContext erc = (ExecRequestContext)it.next();
+        buf.append(erc.toString());
+        buf.append('\n');
+      }
+      return buf.toString();
+    }
+  }
+
+  protected class ExecRequestContext
+    implements Runnable
+  {
+    private final FusionRunnable fusionRunnable;
+    private final Authentication authentication;
+    private final HttpServletRequest request;
+    private final Map<String, Serializable> requestData;
+    private final Locale callerLocale;
+
+    public ExecRequestContext(FusionRunnable runnable)
+    {
+      this.fusionRunnable = runnable;
+
+      HttpServletRequest localrequest = FusionAsyncExecutor.this.httpRequestService.getHttpRequest();
+      if ((localrequest != null) && (!(localrequest instanceof HttpServletRequestCopy)))
+      {
+        localrequest = new HttpServletRequestCopy(localrequest);
+      }
+      this.request = localrequest;
+
+      this.requestData = FusionAsyncExecutor.this.httpRequestService.cloneAssociatedData();
+
+      this.callerLocale = LocaleContextHolder.getLocale();
+      this.authentication = SecurityContextHolder.getContext().getAuthentication();
+    }
+
+    public FusionRunnable getRunnable()
+    {
+      return this.fusionRunnable;
+    }
+
+    protected final RuntimeException dispatch()
+    {
+      ScheduledThreadPoolExecutor exec = FusionAsyncExecutor.this.customExecutor;
+      FusionAsyncExecutor.this.oneMorePoolItem();
+      try
+      {
+        exec.submit(this);
+      }
+      catch (RejectedExecutionException ex1)
+      {
+        FusionAsyncExecutor.this.oneLessPoolItem();
+        String msg = FusionAsyncExecutor.this.getErrMsg();
+        return new TaskRejectedException(msg, ex1);
+      }
+      catch (RuntimeException ex2)
+      {
+        FusionAsyncExecutor.this.oneLessPoolItem();
+        return ex2;
+      }
+      return null;
+    }
+
+    private SecurityException setThreadName(Thread th, String name)
+    {
+      try
+      {
+        th.setName(name);
+      }
+      catch (SecurityException ex)
+      {
+        return ex;
+      }
+      return null;
+    }
+
+    protected void beforeRun()
+    {
+      StringBuilder logmesg = new StringBuilder();
+      FusionAsyncExecutor.this.httpRequestService.setHttpRequest(this.request);
+      FusionAsyncExecutor.this.httpRequestService.setRequestScopedValues(this.requestData);
+
+      if ((FusionAsyncExecutor.LOG.isDebugEnabled()) && (this.request != null))
+      {
+        logmesg.append(String.format("[Request URI = %s, Request User = %s, Request Locale = %s] ", new Object[] { this.request.getRequestURI(), this.request.getUserPrincipal(), this.request.getLocale() }));
+      }
+
+      LocaleContextHolder.setLocale(this.callerLocale);
+
+      if (FusionAsyncExecutor.LOG.isDebugEnabled())
+      {
+        logmesg.append(String.format("[Caller Locale = %s]", new Object[] { this.callerLocale }));
+        FusionAsyncExecutor.LOG.debug(logmesg.toString());
+      }
+
+      SecurityContext ctx = SecurityContextHolder.createEmptyContext();
+      ctx.setAuthentication(this.authentication);
+
+      if (FusionAsyncExecutor.LOG.isDebugEnabled())
+      {
+        FusionAsyncExecutor.LOG.debug(logmesg.toString());
+      }
+      SecurityContextHolder.setContext(ctx);
+    }
+
+    protected void finallyAfterRun()
+    {
+      FusionAsyncExecutor.this.httpRequestService.clearHttpRequest();
+
+      LocaleContextHolder.resetLocaleContext();
+      SecurityContextHolder.clearContext();
+    }
+
+    public final void run()
+    {
+      Thread currentThread = Thread.currentThread();
+      String threadID = Long.toHexString(currentThread.getId());
+      setThreadName(currentThread, new StringBuilder(FusionAsyncExecutor.this.getTagName()).append('_').append(threadID).toString());
+      try
+      {
+        beforeRun();
+        this.fusionRunnable.run();
+      }
+      catch (RuntimeException ex1)
+      {
+        ScheduledThreadPoolExecutor executor;
+        FusionAsyncExecutor.LOG.warn("Received an exception while running in thread-pool: {}", ex1);
+        Thread.UncaughtExceptionHandler exceptionhandler = currentThread.getUncaughtExceptionHandler();
+        if (exceptionhandler != null)
+        {
+          exceptionhandler.uncaughtException(currentThread, ex1);
+        }
+
+        throw ex1;
+      }
+      finally
+      {
+        finallyAfterRun();
+
+        synchronized (FusionAsyncExecutor.this)
+        {
+          ScheduledThreadPoolExecutor executor = FusionAsyncExecutor.this.customExecutor;
+
+          FusionAsyncExecutor.this.oneLessPoolItem();
+          if (!executor.isShutdown())
+          {
+            FusionAsyncExecutor.this.dispatchOneFromQueue();
+          }
+        }
+      }
+      setThreadName(currentThread, threadID);
+    }
+
+    public String toString()
+    {
+      return "runnable:".concat(this.fusionRunnable.getClass().getName());
+    }
+  }
+
+  static enum ExecutorState
+  {
+    INIT, 
+    RUNNING, 
+    SHUTTINGDOWN, 
+    SHUTDOWN;
+  }
+}
