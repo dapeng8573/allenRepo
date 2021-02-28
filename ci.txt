@@ -1,0 +1,27 @@
+package com.hp.ci.mgmt.tasks;
+
+import com.hp.ci.mgmt.spring.ScanAsType;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor.AbortPolicy;
+import org.springframework.context.annotation.Primary;
+import org.springframework.stereotype.Service;
+
+@Primary
+@Service
+@ScanAsType({com.hp.ci.mgmt.spring.ScanType.WEBAPP})
+public class CiScheduledExecutor extends CiBaseExecutor
+{
+  private static final int DEFAULT_CORE_SIZE = 10;
+
+  public CiScheduledExecutor()
+  {
+    super(10, Executors.defaultThreadFactory(), new ThreadPoolExecutor.AbortPolicy());
+  }
+
+  public CiScheduledExecutor(int corePoolSize, ThreadFactory threadFactory, RejectedExecutionHandler handler)
+  {
+    super(corePoolSize, threadFactory, handler);
+  }
+}

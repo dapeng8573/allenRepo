@@ -1,0 +1,96 @@
+package com.hp.ci.mgmt.tasks;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.RunnableScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import javax.annotation.Resource;
+import org.springframework.beans.factory.InitializingBean;
+
+public class CiBaseExecutor extends ScheduledThreadPoolExecutor
+  implements InitializingBean
+{
+  private static final int DEFAULT_KEEP_ALIVE_TIME = 60;
+
+  @Resource
+  private List<TaskDecorator> taskDecorators;
+
+  public void afterPropertiesSet()
+  {
+    Collections.sort(this.taskDecorators);
+  }
+
+  public CiBaseExecutor(int corePoolSize, ThreadFactory threadFactory, RejectedExecutionHandler handler)
+  {
+    super(corePoolSize, threadFactory, handler);
+
+    setKeepAliveTime(60L, TimeUnit.SECONDS);
+    allowCoreThreadTimeOut(true);
+  }
+
+  protected <V> RunnableScheduledFuture<V> decorateTask(Callable<V> callable, RunnableScheduledFuture<V> task)
+  {
+    return decorateTask(task, callable);
+  }
+
+  protected <V> RunnableScheduledFuture<V> decorateTask(Runnable runnable, RunnableScheduledFuture<V> task)
+  {
+    return decorateTask(task, runnable);
+  }
+
+  private <V> RunnableScheduledFuture<V> decorateTask(RunnableScheduledFuture<V> task, Object originalTask)
+  {
+    RunnableScheduledFuture wrappedTask = new SimpleFuture(task, String.valueOf(originalTask));
+
+    for (TaskDecorator decorator : this.taskDecorators)
+    {
+      wrappedTask = decorator.decorateTask(wrappedTask);
+    }
+
+    return wrappedTask;
+  }
+
+  public void setTaskDecorators(List<TaskDecorator> decorators)
+  {
+    this.taskDecorators = new ArrayList(decorators);
+    afterPropertiesSet();
+  }
+
+  public String toString()
+  {
+    StringBuilder builder = new StringBuilder();
+    builder.append(getClass().getSimpleName()).append(" [\n queue=").append(getQueue()).append("\n queueSize=").append(getQueue().size()).append("\n isShutdown=").append(isShutdown()).append("\n isTerminating=").append(isTerminating()).append("\n isTerminated=").append(isTerminated()).append("\n corePoolSize=").append(getCorePoolSize()).append("\n allowsCoreThreadTimeOut=").append(allowsCoreThreadTimeOut()).append("\n maximumPoolSize=").append(getMaximumPoolSize()).append("\n poolSize=").append(getPoolSize()).append("\n activeCount=").append(getActiveCount()).append("\n largestPoolSize=").append(getLargestPoolSize()).append("\n taskCount=").append(getTaskCount()).append("\n completedTaskCount=").append(getCompletedTaskCount()).append("\n]");
+
+    return builder.toString();
+  }
+
+  private static class SimpleFuture<V> extends RunnableScheduledFutureWrapper<V>
+  {
+    private final String name;
+
+    public SimpleFuture(RunnableScheduledFuture<? extends V> toWrap, String name)
+    {
+      super();
+      this.name = name;
+    }
+
+    protected void beforeRun()
+    {
+    }
+
+    protected void finallyAfterRun()
+    {
+    }
+
+    public String toString()
+    {
+      return this.name;
+    }
+  }
+}
